@@ -1,38 +1,54 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useAccessToken } from '../auth/authSession';
+import { ChatMessageContent } from '../components/ChatMessageContent';
 import {
   ApiRequestError,
   generateAiRecommendations,
   sendAiChatMessage,
   type AiChatMessage,
+  type ApiRole,
   type Recommendation,
 } from '../services/api';
-
-interface ChatProps {
-  readonly token: string;
-}
 
 interface UiMessage extends AiChatMessage {
   readonly id: string;
 }
 
 const quickPrompts = [
-  'Explica donde esta el mayor costo del periodo',
+  'Explica dónde está el mayor costo del periodo',
   'Detecta posibles oportunidades en el gasto',
-  'Que acciones priorizarias para reducir costos?',
+  '¿Qué acciones priorizarías para reducir costos?',
 ] as const;
 
-export default function Chat({ token }: ChatProps) {
+interface ChatProps {
+  readonly role: ApiRole;
+}
+
+const recommendationRoles: readonly ApiRole[] = [
+  'ADMIN',
+  'MASTER_ADMIN',
+  'OPERATOR_ADMIN',
+  'LEAD_TECHNICIAN',
+  'FINOPS_TECHNICIAN',
+];
+
+export default function Chat({ role }: ChatProps) {
+  const token = useAccessToken();
+  const canGenerateRecommendations = recommendationRoles.includes(role);
   const [messages, setMessages] = useState<UiMessage[]>([
     {
       id: 'welcome',
       role: 'assistant',
-      content: 'Estoy conectado al motor IA y al resumen FOCUS cargado en Supabase. Preguntame por costos, oportunidades o acciones FinOps.',
+      content: 'Puedo ayudarte a interpretar los costos, el consumo y las oportunidades FinOps disponibles para este tenant. Pregúntame por un periodo, servicio o recurso concreto.',
     },
   ]);
   const [input, setInput] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const historyRef = useRef<HTMLDivElement | null>(null);
+  const historyEndRef = useRef<HTMLDivElement | null>(null);
+  const stickToBottomRef = useRef(true);
 
   const history = useMemo<AiChatMessage[]>(
     () => messages
@@ -40,6 +56,11 @@ export default function Chat({ token }: ChatProps) {
       .map(({ role, content }) => ({ role, content })),
     [messages],
   );
+
+  useEffect(() => {
+    if (!stickToBottomRef.current) return;
+    historyEndRef.current?.scrollIntoView({ block: 'end' });
+  }, [messages, isSending, isGenerating, error]);
 
   const submitMessage = async (message: string) => {
     const trimmed = message.trim();
@@ -106,8 +127,18 @@ export default function Chat({ token }: ChatProps) {
   };
 
   return (
-    <div className="flex flex-col h-[calc(100vh-140px)] lg:h-[calc(100vh-100px)] relative animate-in fade-in duration-500">
-      <div className="flex-1 overflow-y-auto custom-scrollbar p-2 space-y-6">
+    <div data-testid="chat-module" className="relative flex h-full min-h-0 flex-col overflow-hidden animate-in fade-in duration-500">
+      <div
+        data-testid="chat-history"
+        ref={historyRef}
+        className="custom-scrollbar min-h-0 flex-1 space-y-6 overflow-y-auto overscroll-contain p-2"
+        onScroll={() => {
+          const historyElement = historyRef.current;
+          if (historyElement === null) return;
+          const distanceToBottom = historyElement.scrollHeight - historyElement.scrollTop - historyElement.clientHeight;
+          stickToBottomRef.current = distanceToBottom < 48;
+        }}
+      >
         {messages.map((message) => (
           <div
             key={message.id}
@@ -125,10 +156,12 @@ export default function Chat({ token }: ChatProps) {
               className={
                 message.role === 'user'
                   ? 'bg-zinc-800 text-zinc-100 rounded-2xl rounded-tr-sm px-4 py-3 max-w-[85%] sm:max-w-[70%] text-sm whitespace-pre-wrap'
-                  : 'bg-zinc-900 border border-zinc-800 text-zinc-300 rounded-2xl rounded-tl-sm px-4 py-3 max-w-[95%] sm:max-w-[80%] text-sm leading-relaxed whitespace-pre-wrap'
+                  : 'bg-zinc-900 border border-zinc-800 text-zinc-300 rounded-2xl rounded-tl-sm px-4 py-3 max-w-[95%] sm:max-w-[80%] text-sm leading-relaxed'
               }
             >
-              {message.content}
+              {message.role === 'assistant'
+                ? <ChatMessageContent content={message.content} />
+                : message.content}
             </div>
           </div>
         ))}
@@ -143,10 +176,11 @@ export default function Chat({ token }: ChatProps) {
             {error}
           </div>
         )}
+        <div ref={historyEndRef} aria-hidden="true" />
       </div>
       
-      <div className="mt-4 pt-4 border-t border-zinc-800">
-        <div className="flex gap-2 mb-4 overflow-x-auto pb-2 custom-scrollbar">
+      <div data-testid="chat-composer" className="mt-4 shrink-0 border-t border-zinc-800 pt-4">
+        {canGenerateRecommendations && <div className="mb-4 flex flex-wrap gap-2">
           {quickPrompts.map((prompt) => (
             <button
               key={prompt}
@@ -171,7 +205,7 @@ export default function Chat({ token }: ChatProps) {
           >
             <span className="material-symbols-outlined text-[14px]">save</span> Guardar recomendaciones IA
           </button>
-        </div>
+        </div>}
         <form
           className="relative"
           onSubmit={(event) => {
@@ -204,12 +238,12 @@ function formatRecommendations(
   persisted: boolean,
 ): string {
   if (recommendations.length === 0) {
-    return 'La IA no genero recomendaciones validas con el contexto actual.';
+    return 'La IA no generó recomendaciones válidas con el contexto actual.';
   }
 
   const header = persisted
-    ? 'Recomendaciones IA guardadas en la base de datos:'
-    : 'Previsualizacion de recomendaciones IA:';
+    ? '### Recomendaciones IA guardadas\n'
+    : '### Previsualización de recomendaciones IA\n';
 
   return [
     header,
@@ -218,7 +252,7 @@ function formatRecommendations(
         ? ` Ahorro estimado: ${recommendation.currency} ${recommendation.estimatedMonthlySavings.toFixed(2)}.`
         : '';
 
-      return `${index + 1}. [${recommendation.severity}] ${recommendation.title}\n${recommendation.description}${savings}`;
+      return `${index + 1}. **[${recommendation.severity}] ${recommendation.title}**\n\n   ${recommendation.description}${savings}`;
     }),
   ].join('\n\n');
 }

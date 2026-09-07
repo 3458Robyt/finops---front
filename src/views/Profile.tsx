@@ -1,15 +1,29 @@
-import { useState } from 'react';
-import type { ApiUser } from '../services/api';
+import { useEffect, useState } from 'react';
+import { useAccessToken } from '../auth/authSession';
+import { createTelegramSelfLinkCode, fetchAuthSessions, revokeAuthSession, type ApiRole, type ApiUser, type AuthSessionDevice, type TelegramSelfLinkCodeResponse } from '../services/api';
+import { roleLabel } from '../components/navigation';
+import MfaSecurityPanel from '../components/profile/MfaSecurityPanel';
 
 interface ToggleProps {
   checked: boolean;
   onChange: () => void;
 }
 
-export default function Profile({ onLogout, currentRole, user }: { onLogout: () => void, currentRole: 'admin' | 'client', user: ApiUser }) {
-const [twoFactor, setTwoFactor] = useState(true);
-const [notifications, setNotifications] = useState(true);
+export default function Profile({ onLogout, onOpenMessaging, role, user }: {
+  onLogout: () => void | Promise<void>;
+  onOpenMessaging?: () => void;
+  role: ApiRole;
+  user: ApiUser;
+}) {
+  const token = useAccessToken();
 const [persistent, setPersistent] = useState(false);
+const [sessions, setSessions] = useState<readonly AuthSessionDevice[]>([]);
+const [sessionError, setSessionError] = useState<string | null>(null);
+const [revokingSessionId, setRevokingSessionId] = useState<string | null>(null);
+const [telegramCode, setTelegramCode] = useState<TelegramSelfLinkCodeResponse | null>(null);
+const [telegramLoading, setTelegramLoading] = useState(false);
+const [telegramError, setTelegramError] = useState<string | null>(null);
+const [telegramCopied, setTelegramCopied] = useState(false);
 const displayName = user.name.trim() !== '' ? user.name : user.email;
 const initials = displayName
 .split(/\s+/)
@@ -17,6 +31,56 @@ const initials = displayName
 .slice(0, 2)
 .map((part) => part[0]?.toUpperCase() ?? '')
 .join('') || user.email.slice(0, 2).toUpperCase();
+
+useEffect(() => {
+  let cancelled = false;
+  void fetchAuthSessions(token)
+    .then((response) => {
+      if (!cancelled) setSessions(response.sessions);
+    })
+    .catch(() => {
+      if (!cancelled) setSessionError('No fue posible cargar las sesiones activas.');
+    });
+  return () => { cancelled = true; };
+}, [token]);
+
+const revokeSession = async (session: AuthSessionDevice) => {
+  if (session.isCurrent) return;
+  setRevokingSessionId(session.id);
+  setSessionError(null);
+  try {
+    await revokeAuthSession(token, session.id);
+    setSessions((current) => current.filter((item) => item.id !== session.id));
+  } catch {
+    setSessionError('No fue posible revocar esa sesión.');
+  } finally {
+    setRevokingSessionId(null);
+  }
+};
+
+const generateTelegramCode = async () => {
+  setTelegramLoading(true);
+  setTelegramError(null);
+  setTelegramCopied(false);
+  try {
+    const response = await createTelegramSelfLinkCode(token);
+    setTelegramCode(response);
+  } catch (error) {
+    setTelegramError(error instanceof Error ? error.message : 'No fue posible generar el código de Telegram.');
+  } finally {
+    setTelegramLoading(false);
+  }
+};
+
+const copyTelegramLink = async () => {
+  if (telegramCode?.deepLink === undefined) return;
+  try {
+    await navigator.clipboard.writeText(telegramCode.deepLink);
+    setTelegramCopied(true);
+  } catch {
+    setTelegramError('No fue posible copiar el enlace; usa el comando mostrado.');
+  }
+};
 
   return (
     <div className="space-y-6 lg:space-y-8 animate-in fade-in duration-500">
@@ -35,13 +99,13 @@ const initials = displayName
           <div className="flex-1 text-center md:text-left space-y-4">
             <div>
               <span className="inline-block bg-tak-yellow/10 text-tak-yellow text-[10px] font-black px-2 py-1 rounded uppercase tracking-widest mb-2">
-                {currentRole === 'admin' ? 'Administrador del Sistema' : 'Nivel de Acceso: Ejecutivo'}
+                {roleLabel(role)}
               </span>
               <h2 className="text-3xl font-black text-white">
                 {displayName}
               </h2>
               <p className="text-zinc-500 font-medium">
-                {currentRole === 'admin' ? 'Admin de Cloud & FinOps Lead' : 'Lector Panel de Control'}
+                {role === 'CLIENT_APPROVER' || role === 'CLIENT_VIEWER' || role === 'VIEWER' ? 'Portal ejecutivo FinOps' : 'Operación y gobierno FinOps'}
               </p>
             </div>
             
@@ -76,20 +140,32 @@ const initials = displayName
           </div>
           <div className="p-6 space-y-6 flex-1 flex flex-col justify-between">
             <div className="space-y-6">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-sm font-bold text-zinc-100 uppercase tracking-tight">Autenticación 2FA</p>
-                  <p className="text-xs text-zinc-500 mt-1">Añade una capa extra de seguridad.</p>
+              <MfaSecurityPanel />
+              <div className="rounded-2xl border border-zinc-800 bg-zinc-950 p-4">
+                <div className="flex items-start gap-3">
+                  <span className="material-symbols-outlined text-sky-400">send</span>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-bold text-zinc-100">Conectar Telegram</p>
+                    <p className="mt-1 text-xs leading-relaxed text-zinc-500">Genera un código de un solo uso y envíalo al bot con el comando <span className="font-mono text-zinc-300">/start código</span>.</p>
+                    <button type="button" onClick={() => void generateTelegramCode()} disabled={telegramLoading} className="mt-3 rounded-lg border border-sky-500/30 px-3 py-2 text-xs font-black uppercase tracking-widest text-sky-300 hover:bg-sky-500/10 disabled:opacity-50">
+                      {telegramLoading ? 'Generando…' : 'Generar código'}
+                    </button>
+                    {telegramCode !== null && <div className="mt-3 space-y-2 rounded-lg border border-sky-500/20 bg-sky-500/5 p-3">
+                      {telegramCode.deepLink !== undefined && <div className="flex flex-wrap items-center gap-2"><a href={telegramCode.deepLink} target="_blank" rel="noreferrer" className="text-xs font-bold text-sky-300 underline">Abrir bot</a><button type="button" onClick={() => void copyTelegramLink()} className="text-[10px] font-black uppercase text-zinc-400 hover:text-white">{telegramCopied ? 'Copiado' : 'Copiar enlace'}</button></div>}
+                      <p className="break-all font-mono text-xs text-zinc-200">{telegramCode.startCommand}</p>
+                      <p className="text-[10px] text-zinc-500">Expira: {new Date(telegramCode.expiresAt).toLocaleTimeString('es-CO')}</p>
+                    </div>}
+                    {telegramError !== null && <p className="mt-2 text-xs text-red-400">{telegramError}</p>}
+                  </div>
                 </div>
-                <Toggle checked={twoFactor} onChange={() => setTwoFactor(!twoFactor)} />
               </div>
-              <div className="flex items-center justify-between">
+              {onOpenMessaging !== undefined && <div className="flex items-center justify-between gap-4 rounded-2xl border border-sky-500/20 bg-sky-500/5 p-4">
                 <div>
-                  <p className="text-sm font-bold text-zinc-100 uppercase tracking-tight">Recordatorios de ahorro</p>
-                  <p className="text-xs text-zinc-500 mt-1">Avisos in-app sobre oportunidades y ahorro no capturado.</p>
+                  <p className="text-sm font-bold text-zinc-100 uppercase tracking-tight">Preferencias de mensajería</p>
+                  <p className="text-xs text-zinc-500 mt-1">Configura correo, Telegram y los tipos de alertas desde el centro de Mensajería.</p>
                 </div>
-                <Toggle checked={notifications} onChange={() => setNotifications(!notifications)} />
-              </div>
+                <button type="button" onClick={onOpenMessaging} className="shrink-0 rounded-lg border border-sky-500/30 px-3 py-2 text-[10px] font-black uppercase tracking-widest text-sky-300 hover:bg-sky-500/10">Abrir</button>
+              </div>}
               <div className="flex items-center justify-between">
                 <div>
                   <p className="text-sm font-bold text-zinc-100 uppercase tracking-tight">Sesión Persistente</p>
@@ -118,33 +194,20 @@ const initials = displayName
             <h3 className="text-lg font-bold text-white">Sesiones Activas</h3>
           </div>
           <div className="p-6 space-y-4">
-            <div className="flex items-start gap-4 p-4 bg-zinc-950 rounded-2xl border border-zinc-800/50">
-              <div className="size-10 bg-tak-yellow/10 flex items-center justify-center rounded-xl shrink-0">
-                <span className="material-symbols-outlined text-tak-yellow">laptop_mac</span>
+            {sessionError !== null && <p className="text-xs text-red-400">{sessionError}</p>}
+            {sessions.length === 0 && sessionError === null && <p className="text-xs text-zinc-500">No hay sesiones activas adicionales.</p>}
+            {sessions.map((session) => (
+              <div key={session.id} className={`flex items-start gap-4 p-4 rounded-2xl border ${session.isCurrent ? 'bg-zinc-950 border-zinc-800/50' : 'bg-zinc-950/50 border-zinc-800/30'}`}>
+                <div className={`size-10 flex items-center justify-center rounded-xl shrink-0 ${session.isCurrent ? 'bg-tak-yellow/10 text-tak-yellow' : 'bg-zinc-800 text-zinc-400'}`}>
+                  <span className="material-symbols-outlined">{session.isCurrent ? 'laptop_mac' : 'devices'}</span>
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className={`text-xs font-bold truncate ${session.isCurrent ? 'text-white' : 'text-zinc-400'}`}>{session.userAgent ?? 'Cliente desconocido'}</p>
+                  <p className="text-[10px] text-zinc-500 mt-1 uppercase">{session.isCurrent ? 'Sesión actual' : `IP ${session.ipAddress ?? 'no disponible'}`}</p>
+                </div>
+                {session.isCurrent ? <span className="size-2 rounded-full bg-green-500 animate-pulse mt-1" /> : <button onClick={() => void revokeSession(session)} disabled={revokingSessionId === session.id} className="text-[10px] font-black uppercase text-red-400 hover:text-red-300 disabled:opacity-50">Revocar</button>}
               </div>
-              <div className="flex-1">
-                <p className="text-xs font-bold text-white">MacBook Pro - Bogotá, CO</p>
-                <p className="text-[10px] text-zinc-500 mt-1 uppercase">Chrome • En línea ahora</p>
-              </div>
-              <span className="size-2 rounded-full bg-green-500 animate-pulse mt-1"></span>
-            </div>
-            
-            <div className="flex items-start gap-4 p-4 bg-zinc-950/50 rounded-2xl border border-zinc-800/30">
-              <div className="size-10 bg-zinc-800 flex items-center justify-center rounded-xl shrink-0 text-zinc-400">
-                <span className="material-symbols-outlined">smartphone</span>
-              </div>
-              <div className="flex-1">
-                <p className="text-xs font-bold text-zinc-400">iPhone 15 - Bogotá, CO</p>
-                <p className="text-[10px] text-zinc-500 mt-1 uppercase">App TAK • Hace 2 horas</p>
-              </div>
-            </div>
-            
-            <div className="pt-2">
-              <button className="text-xs font-bold text-tak-yellow/80 hover:text-tak-yellow transition-colors uppercase tracking-widest flex items-center gap-1">
-                Ver todo el historial de acceso
-                <span className="material-symbols-outlined text-sm">arrow_forward</span>
-              </button>
-            </div>
+            ))}
           </div>
         </div>
       </div>

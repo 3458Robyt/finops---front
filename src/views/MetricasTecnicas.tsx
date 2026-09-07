@@ -1,343 +1,58 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useMemo } from 'react';
 import { TechnicalMetricUPlot } from '../components/TechnicalMetricUPlot';
+import { type TechnicalMetricBucket } from '../services/api';
+import { KpiCard, MiniMetric, OpportunityCard, SelectField, StatCard } from './technical-metrics/TechnicalMetricsCards';
+import { ResourceCostPanel, SamplesTable } from './technical-metrics/TechnicalMetricsDetailPanels';
+import { type MetricGroupFilter, type RangeFilter } from './technical-metrics/technicalMetricsModel';
 import {
-  fetchTechnicalMetricsCoverage,
-  fetchTechnicalMetricSamples,
-  fetchTechnicalMetricSeries,
-  fetchTechnicalMetricsOverview,
-  type ResourceMetricSampleItem,
-  type TechnicalMetricBucket,
-  type TechnicalMetricGroup,
-  type TechnicalMetricKpi,
-  type TechnicalMetricOpportunity,
-  type TechnicalMetricCoverage,
-  type TechnicalMetricSeriesPoint,
-  type TechnicalMetricsOverview,
-} from '../services/api';
+  formatCurrency,
+  formatDateTime,
+  formatNumber,
+  groupLabels,
+  resourceLegendLabel,
+  resourceOptionLabel,
+} from './technical-metrics/technicalMetricsPresentation';
+import { useTechnicalMetricsController } from './technical-metrics/useTechnicalMetricsController';
 
-type MetricGroupFilter = TechnicalMetricGroup | 'ALL';
-type RangeFilter = 'available' | '24h' | '7d' | '30d';
-
-interface SeriesMeta {
-  readonly hasMore: boolean;
-  readonly nextCursor?: string;
-  readonly returnedPoints: number;
-  readonly totalSamples: number;
-  readonly queryMs: number;
-  readonly bucket: Exclude<TechnicalMetricBucket, 'auto'>;
+function formatStatisticLabel(statistic: string): string {
+  const labels: Record<string, string> = {
+    MEAN: 'Promedio (mean)',
+    MIN: 'Mínimo (min)',
+    MAX: 'Máximo (max)',
+    P50: 'Percentil 50 (p50)',
+    P90: 'Percentil 90 (p90)',
+    P95: 'Percentil 95 (p95)',
+    P99: 'Percentil 99 (p99)',
+    SUM: 'Suma (sum)',
+    COUNT: 'Conteo (count)',
+    RATE: 'Tasa (rate)',
+    LATEST: 'Último valor (latest)',
+  };
+  return labels[statistic] ?? statistic;
 }
 
-interface SeriesCacheEntry {
-  readonly createdAt: number;
-  readonly series: readonly TechnicalMetricSeriesPoint[];
-  readonly meta: SeriesMeta;
-}
-
-interface DrilldownWindow {
-  readonly startDate: string;
-  readonly endDate: string;
-}
-
-const seriesPageSize = 1000;
-const maxSeriesCacheEntries = 8;
-const seriesCacheTtlMs = 2 * 60 * 1000;
-
-const groupLabels: Readonly<Record<MetricGroupFilter, string>> = {
-  ALL: 'Todas',
-  CPU: 'CPU',
-  MEMORY: 'Memoria',
-  NETWORK: 'Red',
-  DISK: 'Disco',
-  SYSTEM: 'Sistema',
-  OTHER: 'Otras',
-};
-
-const severityStyles: Readonly<Record<TechnicalMetricOpportunity['severity'], string>> = {
-  INFO: 'border-sky-500/20 bg-sky-500/10 text-sky-200',
-  LOW: 'border-emerald-500/20 bg-emerald-500/10 text-emerald-200',
-  MEDIUM: 'border-tak-yellow/20 bg-tak-yellow/10 text-tak-yellow',
-  HIGH: 'border-red-500/20 bg-red-500/10 text-red-200',
-};
-
-const currencyFormatter = new Intl.NumberFormat('en-US', {
-  style: 'currency',
-  currency: 'USD',
-  maximumFractionDigits: 2,
-});
-
-export default function MetricasTecnicas({ token }: { readonly token: string }) {
-  const [overview, setOverview] = useState<TechnicalMetricsOverview | null>(null);
-  const [coverage, setCoverage] = useState<TechnicalMetricCoverage | null>(null);
-  const [series, setSeries] = useState<readonly TechnicalMetricSeriesPoint[]>([]);
-  const [samples, setSamples] = useState<readonly ResourceMetricSampleItem[]>([]);
-  const [selectedResource, setSelectedResource] = useState('ALL');
-  const [selectedGroup, setSelectedGroup] = useState<MetricGroupFilter>('ALL');
-  const [selectedMetric, setSelectedMetric] = useState<string | null>(null);
-  const [range, setRange] = useState<RangeFilter>('available');
-  const [bucket, setBucket] = useState<TechnicalMetricBucket>('auto');
-  const [drilldownWindow, setDrilldownWindow] = useState<DrilldownWindow | null>(null);
-  const [seriesMeta, setSeriesMeta] = useState<SeriesMeta | null>(null);
-  const [seriesNextCursor, setSeriesNextCursor] = useState<string | null>(null);
-  const [loadingOverview, setLoadingOverview] = useState(true);
-  const [loadingSeries, setLoadingSeries] = useState(false);
-  const [loadingMoreSeries, setLoadingMoreSeries] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const seriesCacheRef = useRef(new Map<string, SeriesCacheEntry>());
-  const seriesRequestGenerationRef = useRef(0);
-  const nextSeriesControllerRef = useRef<AbortController | null>(null);
-  const rangeParams = useMemo(
-    () => buildRangeParams(range, coverage),
-    [range, coverage],
-  );
-
-  useEffect(() => {
-    seriesCacheRef.current.clear();
-  }, [token]);
-
-  useEffect(() => {
-    let active = true;
-    queueMicrotask(() => {
-      if (active) {
-        setLoadingOverview(true);
-        setError(null);
-      }
-    });
-
-    Promise.all([
-      fetchTechnicalMetricsOverview(token, {
-        ...rangeParams,
-        ...(selectedResource !== 'ALL' ? { externalResourceId: selectedResource } : {}),
-      }),
-      fetchTechnicalMetricsCoverage(token, {
-        ...rangeParams,
-        ...(selectedResource !== 'ALL' ? { externalResourceId: selectedResource } : {}),
-      }),
-      fetchTechnicalMetricSamples(token, 50),
-    ])
-      .then(([overviewResponse, coverageResponse, samplesResponse]) => {
-        if (!active) {
-          return;
-        }
-
-        setOverview(overviewResponse.overview);
-        setCoverage(coverageResponse.coverage);
-        setSamples(samplesResponse.samples);
-      })
-      .catch((cause: unknown) => {
-        if (active) {
-          setOverview(null);
-          setCoverage(null);
-          setSeries([]);
-          setSamples([]);
-          setError(cause instanceof Error ? cause.message : 'No se pudieron cargar las metricas tecnicas.');
-        }
-      })
-      .finally(() => {
-        if (active) {
-          setLoadingOverview(false);
-        }
-      });
-
-    return () => {
-      active = false;
-    };
-  }, [rangeParams, selectedResource, token]);
-
-  const metricOptions = useMemo(() => {
-    const metrics = overview?.metrics ?? [];
-    return selectedGroup === 'ALL'
-      ? metrics
-      : metrics.filter((metric) => metric.group === selectedGroup);
-  }, [overview?.metrics, selectedGroup]);
-
-  const activeMetric = useMemo(() => {
-    if (selectedMetric !== null && metricOptions.some((metric) => metric.metricName === selectedMetric)) {
-      return selectedMetric;
-    }
-
-    return metricOptions[0]?.metricName ?? null;
-  }, [metricOptions, selectedMetric]);
-
-  useEffect(() => {
-    seriesRequestGenerationRef.current += 1;
-    nextSeriesControllerRef.current?.abort();
-    nextSeriesControllerRef.current = null;
-  }, [activeMetric, bucket, drilldownWindow, range, rangeParams, selectedResource, token]);
-
-  const handleDrilldown = useCallback((window: DrilldownWindow) => {
-    setDrilldownWindow(window);
-  }, []);
-
-  const loadNextSeriesPage = useCallback(async (): Promise<void> => {
-    if (activeMetric === null || seriesNextCursor === null || loadingMoreSeries) {
-      return;
-    }
-
-    const requestGeneration = seriesRequestGenerationRef.current;
-    const controller = new AbortController();
-    nextSeriesControllerRef.current?.abort();
-    nextSeriesControllerRef.current = controller;
-    setLoadingMoreSeries(true);
-    try {
-      const requestRange = drilldownWindow ?? rangeParams;
-      const effectiveBucket = drilldownWindow === null
-        ? resolveRequestBucket(bucket, range)
-        : 'raw';
-      const response = await fetchTechnicalMetricSeries(
-        token,
-        {
-          ...requestRange,
-          metricNames: [activeMetric],
-          bucket: effectiveBucket,
-          pageSize: seriesPageSize,
-          cursor: seriesNextCursor,
-          ...(selectedResource !== 'ALL' ? { externalResourceId: selectedResource } : {}),
-        },
-        { signal: controller.signal },
-      );
-
-      if (requestGeneration !== seriesRequestGenerationRef.current || controller.signal.aborted) {
-        return;
-      }
-
-      setSeries((current) => [...current, ...response.series]);
-      setSeriesMeta((current) => current === null ? {
-        hasMore: response.meta.hasMore,
-        nextCursor: response.meta.nextCursor,
-        returnedPoints: response.series.length,
-        totalSamples: response.meta.totalSamples,
-        queryMs: response.meta.queryMs,
-        bucket: response.meta.bucket,
-      } : {
-        ...current,
-        hasMore: response.meta.hasMore,
-        nextCursor: response.meta.nextCursor,
-        returnedPoints: current.returnedPoints + response.series.length,
-        totalSamples: current.totalSamples || response.meta.totalSamples,
-        queryMs: current.queryMs + response.meta.queryMs,
-      });
-      setSeriesNextCursor(response.meta.nextCursor ?? null);
-    } catch (cause: unknown) {
-      if (cause instanceof DOMException && cause.name === 'AbortError') {
-        return;
-      }
-      setError(cause instanceof Error ? cause.message : 'No se pudo cargar la siguiente pagina de metricas.');
-    } finally {
-      if (requestGeneration === seriesRequestGenerationRef.current) {
-        setLoadingMoreSeries(false);
+export default function MetricasTecnicas() {
+  const {
+    overview, coverage, samples, selectedResource, selectedGroup, range, bucket, selectedStatistic, statisticOptions, drilldownWindow,
+    loadingOverview, loadingMoreSeries, error, metricOptions, activeMetric, selectedMetricMeta, filteredKpis,
+    visibleSeries, visibleSeriesMeta, visibleLoadingSeries, topResourceCost, selectedCoverageMetric,
+    setSelectedResource, setSelectedGroup, setSelectedMetric, setRange, setBucket, setSelectedStatistic, setDrilldownWindow,
+    handleDrilldown, loadNextSeriesPage,
+  } = useTechnicalMetricsController();
+  const canonicalResourceLabels = useMemo(() => {
+    const labels = new Map<string, string>();
+    for (const resource of overview?.resources ?? []) {
+      const label = resourceLegendLabel(resource);
+      labels.set(resource.externalResourceId, label);
+      if (resource.cloudResourceId !== undefined) {
+        labels.set(resource.cloudResourceId, label);
       }
     }
-  }, [activeMetric, bucket, drilldownWindow, loadingMoreSeries, range, rangeParams, selectedResource, seriesNextCursor, token]);
-
-  useEffect(() => {
-    if (activeMetric === null) {
-      return;
-    }
-
-    if (range === 'available' && (
-      rangeParams.startDate === undefined ||
-      rangeParams.endDate === undefined
-    )) {
-      return;
-    }
-
-    let active = true;
-    const controller = new AbortController();
-    const requestBucket = resolveRequestBucket(bucket, range);
-    const requestRange = drilldownWindow ?? rangeParams;
-    const effectiveBucket = drilldownWindow === null ? requestBucket : 'raw';
-    const cacheKey = JSON.stringify({
-      activeMetric,
-      bucket: effectiveBucket,
-      requestRange,
-      selectedResource,
-    });
-    const cachedSeries = getSeriesCache(seriesCacheRef.current, cacheKey);
-    if (cachedSeries !== null) {
-      setSeries(cachedSeries.series);
-      setSeriesMeta(cachedSeries.meta);
-      setSeriesNextCursor(cachedSeries.meta.nextCursor ?? null);
-      setLoadingSeries(false);
-      return;
-    }
-
-    setLoadingSeries(true);
-    setSeries([]);
-    setSeriesMeta(null);
-    setSeriesNextCursor(null);
-
-    const loadSeries = async (): Promise<void> => {
-      const response = await fetchTechnicalMetricSeries(
-        token,
-        {
-          ...requestRange,
-          metricNames: [activeMetric],
-          bucket: effectiveBucket,
-          pageSize: seriesPageSize,
-          ...(selectedResource !== 'ALL' ? { externalResourceId: selectedResource } : {}),
-        },
-        { signal: controller.signal },
-      );
-
-      if (!active) {
-        return;
-      }
-
-      const meta: SeriesMeta = {
-        hasMore: response.meta.hasMore,
-        nextCursor: response.meta.nextCursor,
-        returnedPoints: response.series.length,
-        totalSamples: response.meta.totalSamples,
-        queryMs: response.meta.queryMs,
-        bucket: response.meta.bucket,
-      };
-      setSeries(response.series);
-      setSeriesMeta(meta);
-      setSeriesNextCursor(response.meta.nextCursor ?? null);
-      setSeriesCache(seriesCacheRef.current, cacheKey, {
-        createdAt: Date.now(),
-        series: response.series,
-        meta,
-      });
-    };
-
-    void loadSeries()
-      .catch((cause: unknown) => {
-        if (active) {
-          setSeries([]);
-          setSeriesMeta(null);
-          if (cause instanceof DOMException && cause.name === 'AbortError') {
-            return;
-          }
-          setError(cause instanceof Error ? cause.message : 'No se pudo cargar la serie de metricas.');
-        }
-      })
-      .finally(() => {
-        if (active) {
-          setLoadingSeries(false);
-        }
-      });
-
-    return () => {
-      active = false;
-      controller.abort();
-    };
-  }, [activeMetric, bucket, drilldownWindow, range, rangeParams, selectedResource, token]);
-
-  const selectedMetricMeta = metricOptions.find((metric) => metric.metricName === activeMetric);
-  const seriesUnavailable = range === 'available' && (
-    rangeParams.startDate === undefined ||
-    rangeParams.endDate === undefined
-  );
-  const visibleSeries = seriesUnavailable ? [] : series;
-  const visibleSeriesMeta = seriesUnavailable ? null : seriesMeta;
-  const visibleLoadingSeries = seriesUnavailable ? false : loadingSeries;
-  const filteredKpis = useMemo(() => {
-    const kpis = overview?.kpis ?? [];
-    return selectedGroup === 'ALL' ? kpis : kpis.filter((kpi) => kpi.group === selectedGroup);
-  }, [overview?.kpis, selectedGroup]);
-  const topResourceCost = overview?.resources.find((resource) => resource.cost !== undefined)?.cost;
-  const selectedCoverageMetric = coverage?.metrics.find((metric) => metric.metricName === activeMetric);
+    return labels;
+  }, [overview?.resources]);
+  const visibleGroupOptions = Object.entries(groupLabels).filter(([value]) => (
+    value === 'ALL' || (overview?.metrics ?? []).some((metric) => metric.group === value)
+  ));
 
   return (
     <div className="space-y-6 lg:space-y-8 animate-in fade-in duration-500">
@@ -362,7 +77,7 @@ export default function MetricasTecnicas({ token }: { readonly token: string }) 
       )}
 
       <section className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
-        <StatCard icon="database" label="Muestras tecnicas" value={loadingOverview && overview === null ? '...' : formatNumber(overview?.sampleCount ?? 0)} helper={formatRange(overview)} />
+        <StatCard icon="database" label={`Muestras ${formatStatisticLabel(selectedStatistic)}`} value={loadingOverview && overview === null ? '...' : formatNumber(overview?.sampleCount ?? 0)} helper="Solo la estadística seleccionada; el total global incluye todas." />
         <StatCard icon="dns" label="Recursos detectados" value={loadingOverview && overview === null ? '...' : formatNumber(overview?.resourceCount ?? 0)} helper="Derivados de metricas reales" />
         <StatCard icon="monitoring" label="Metricas disponibles" value={loadingOverview && overview === null ? '...' : formatNumber(overview?.metricCount ?? 0)} helper={selectedMetricMeta?.metricName ?? 'Sin metrica seleccionada'} />
         <StatCard
@@ -392,29 +107,29 @@ export default function MetricasTecnicas({ token }: { readonly token: string }) 
           <MiniMetric label="Dias metrica" value={`${selectedCoverageMetric?.daysWithData ?? 0}/${selectedCoverageMetric?.expectedDays ?? coverage?.expectedDays ?? 0}`} />
         </div>
         <div className="mt-4 flex flex-wrap gap-1">
-          {(coverage?.days ?? []).slice(-30).map((day) => (
+          {(coverage?.days ?? []).map((day) => (
             <span
               key={day.date}
               title={`${day.date}: ${day.sampleCount} muestras`}
-              className={`h-3 w-6 rounded-full ${day.status === 'WITH_DATA' ? 'bg-tak-yellow' : 'bg-zinc-800'}`}
+              className={`h-3 min-w-2 flex-1 rounded-full ${day.status === 'WITH_DATA' ? 'bg-tak-yellow' : 'bg-zinc-800'}`}
             />
           ))}
         </div>
       </section>
 
       <section className="rounded-3xl border border-zinc-800 bg-zinc-900 p-4 lg:p-5">
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-5">
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-6">
           <SelectField label="Recurso" value={selectedResource} onChange={(value) => { setDrilldownWindow(null); setSelectedResource(value); }}>
             <option value="ALL">Todos los recursos</option>
             {(overview?.resources ?? []).map((resource) => (
-              <option key={resource.externalResourceId} value={resource.externalResourceId}>
-                {shortResource(resource.externalResourceId)}
+              <option key={resource.cloudResourceId ?? resource.externalResourceId} value={resource.externalResourceId}>
+                {resourceOptionLabel(resource)}
               </option>
             ))}
           </SelectField>
 
           <SelectField label="Grupo" value={selectedGroup} onChange={(value) => { setDrilldownWindow(null); setSelectedGroup(value as MetricGroupFilter); }}>
-            {Object.entries(groupLabels).map(([value, label]) => (
+            {visibleGroupOptions.map(([value, label]) => (
               <option key={value} value={value}>{label}</option>
             ))}
           </SelectField>
@@ -432,6 +147,7 @@ export default function MetricasTecnicas({ token }: { readonly token: string }) 
             <option value="24h">Ultimas 24 h</option>
             <option value="7d">Ultimos 7 dias</option>
             <option value="30d">Ultimos 30 dias</option>
+            <option value="90d">Ultimos 90 dias</option>
           </SelectField>
 
           <SelectField label="Granularidad" value={bucket} onChange={(value) => { setDrilldownWindow(null); setBucket(value as TechnicalMetricBucket); }}>
@@ -440,6 +156,12 @@ export default function MetricasTecnicas({ token }: { readonly token: string }) 
             <option value="30m">30 min</option>
             <option value="hour">Hora</option>
             <option value="day">Dia</option>
+          </SelectField>
+
+          <SelectField label="Estadistica" value={selectedStatistic} onChange={(value) => { setDrilldownWindow(null); setSelectedStatistic(value as typeof selectedStatistic); }}>
+            {statisticOptions.map((statistic) => (
+              <option key={statistic} value={statistic}>{formatStatisticLabel(statistic)}</option>
+            ))}
           </SelectField>
         </div>
       </section>
@@ -450,13 +172,13 @@ export default function MetricasTecnicas({ token }: { readonly token: string }) 
             <div>
               <h3 className="text-lg font-bold text-white">Serie temporal</h3>
               <p className="text-xs text-zinc-500">
-                {activeMetric ?? 'Sin metrica'} {selectedMetricMeta?.metricUnit !== undefined ? `(${selectedMetricMeta.metricUnit})` : ''}
+                {activeMetric ?? 'Sin metrica'} · {formatStatisticLabel(selectedStatistic)} {selectedMetricMeta?.metricUnit !== undefined ? `(${selectedMetricMeta.metricUnit})` : ''}
               </p>
             </div>
             <span className="rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-2 text-[10px] font-black uppercase tracking-widest text-tak-yellow">
               {visibleLoadingSeries
                 ? `${visibleSeriesMeta?.returnedPoints ?? visibleSeries.length}/${visibleSeriesMeta?.totalSamples ?? selectedCoverageMetric?.sampleCount ?? 0}`
-                : `${visibleSeriesMeta?.totalSamples ?? selectedCoverageMetric?.sampleCount ?? visibleSeries.length} muestras crudas · ${visibleSeries.length} puntos`}
+                : `${visibleSeriesMeta?.totalSamples ?? selectedCoverageMetric?.sampleCount ?? visibleSeries.length} muestras fuente · ${visibleSeries.length} puntos ${visibleSeriesMeta?.bucket === 'raw' ? 'crudos' : 'agregados'}`}
             </span>
           </div>
 
@@ -475,10 +197,12 @@ export default function MetricasTecnicas({ token }: { readonly token: string }) 
             </div>
           )}
 
-          <div className="h-[360px] w-full">
+          <div className="w-full">
             <TechnicalMetricUPlot
               points={visibleSeries}
               unit={selectedMetricMeta?.metricUnit}
+              statistic={selectedStatistic}
+              resourceLabels={canonicalResourceLabels}
               loading={visibleLoadingSeries || loadingOverview}
               separateResources={selectedResource === 'ALL'}
               onSelectRange={handleDrilldown}
@@ -496,7 +220,7 @@ export default function MetricasTecnicas({ token }: { readonly token: string }) 
           )}
         </div>
 
-        <div className="rounded-3xl border border-zinc-800 bg-zinc-900 p-5">
+        <div data-testid="technical-metric-opportunities" className="rounded-3xl border border-zinc-800 bg-zinc-900 p-5">
           <div className="mb-5 flex items-center justify-between gap-3">
             <div>
               <h3 className="text-lg font-bold text-white">Oportunidades tecnicas</h3>
@@ -530,347 +254,4 @@ export default function MetricasTecnicas({ token }: { readonly token: string }) 
       </section>
     </div>
   );
-}
-
-function StatCard({ icon, label, value, helper }: {
-  readonly icon: string;
-  readonly label: string;
-  readonly value: string;
-  readonly helper: string;
-}) {
-  return (
-    <div className="rounded-3xl border border-zinc-800 bg-zinc-900 p-5">
-      <div className="mb-4 flex items-center justify-between gap-3">
-        <span className="material-symbols-outlined text-tak-yellow">{icon}</span>
-        <span className="h-2 w-2 rounded-full bg-tak-yellow" />
-      </div>
-      <p className="text-xs font-black uppercase tracking-widest text-zinc-500">{label}</p>
-      <p className="mt-2 truncate text-2xl font-black text-white">{value}</p>
-      <p className="mt-1 truncate text-xs font-medium text-zinc-500">{helper}</p>
-    </div>
-  );
-}
-
-function SelectField({ label, value, onChange, children }: {
-  readonly label: string;
-  readonly value: string;
-  readonly onChange: (value: string) => void;
-  readonly children: ReactNode;
-}) {
-  return (
-    <label className="block">
-      <span className="mb-1 block text-[10px] font-black uppercase tracking-widest text-zinc-500">{label}</span>
-      <select
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-        className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-3 text-sm font-bold text-white outline-none transition-colors focus:border-tak-yellow"
-      >
-        {children}
-      </select>
-    </label>
-  );
-}
-
-function KpiCard({ kpi }: { readonly kpi: TechnicalMetricKpi }) {
-  return (
-    <div className="rounded-3xl border border-zinc-800 bg-zinc-900 p-5">
-      <div className="mb-4 flex items-center justify-between gap-3">
-        <p className="text-sm font-black text-white">{kpi.label}</p>
-        <span className="rounded-lg border border-zinc-800 bg-zinc-950 px-2 py-1 text-[10px] font-black text-tak-yellow">
-          {kpi.sampleCount}
-        </span>
-      </div>
-      <div className="h-20">
-        <KpiSparkline values={[kpi.minimum, kpi.average, kpi.maximum, kpi.latest]} />
-      </div>
-      <div className="mt-4 grid grid-cols-2 gap-3 text-xs">
-        <MiniMetric label="Promedio" value={formatMetricValue(kpi.average, kpi.unit)} />
-        <MiniMetric label="Pico" value={formatMetricValue(kpi.maximum, kpi.unit)} />
-        <MiniMetric label="Ultimo" value={formatMetricValue(kpi.latest, kpi.unit)} />
-        <MiniMetric label="Actualizado" value={formatShortDate(kpi.latestSampledAt)} />
-      </div>
-    </div>
-  );
-}
-
-function KpiSparkline({ values }: { readonly values: readonly number[] }) {
-  const points = values.filter(Number.isFinite);
-  if (points.length < 2) {
-    return <div className="h-full rounded-xl border border-zinc-800 bg-zinc-950" />;
-  }
-
-  const min = Math.min(...points);
-  const max = Math.max(...points);
-  const range = max - min || 1;
-  const coordinates = values.map((value, index) => {
-    const x = (index / Math.max(1, values.length - 1)) * 100;
-    const y = Number.isFinite(value) ? 92 - ((value - min) / range) * 84 : 92;
-    return `${x},${y}`;
-  }).join(' ');
-
-  return (
-    <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="h-full w-full" aria-hidden="true">
-      <polyline points={`0,100 ${coordinates} 100,100`} fill="#facc15" fillOpacity="0.16" stroke="none" />
-      <polyline points={coordinates} fill="none" stroke="#facc15" strokeWidth="3" vectorEffect="non-scaling-stroke" />
-    </svg>
-  );
-}
-
-function MiniMetric({ label, value }: { readonly label: string; readonly value: string }) {
-  return (
-    <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
-      <p className="text-[10px] font-black uppercase tracking-widest text-zinc-500">{label}</p>
-      <p className="mt-1 truncate text-sm font-black text-white">{value}</p>
-    </div>
-  );
-}
-
-function OpportunityCard({ opportunity }: { readonly opportunity: TechnicalMetricOpportunity }) {
-  return (
-    <div className={`rounded-2xl border p-4 ${severityStyles[opportunity.severity]}`}>
-      <div className="mb-2 flex items-start justify-between gap-3">
-        <p className="text-sm font-black text-white">{opportunity.title}</p>
-        <span className="rounded bg-zinc-950/70 px-2 py-1 text-[10px] font-black">{opportunity.severity}</span>
-      </div>
-      <p className="text-xs leading-relaxed text-zinc-300">{opportunity.description}</p>
-      <div className="mt-3 flex flex-wrap gap-2 text-[10px] font-black uppercase tracking-widest">
-        {opportunity.value !== undefined && (
-          <span className="rounded-lg border border-zinc-700 bg-zinc-950 px-2 py-1 text-zinc-300">
-            {formatMetricValue(opportunity.value, opportunity.unit)}
-          </span>
-        )}
-        {opportunity.cost !== undefined && (
-          <span className="rounded-lg border border-zinc-700 bg-zinc-950 px-2 py-1 text-tak-yellow">
-            {formatCurrency(opportunity.cost, opportunity.currency ?? 'USD')}
-          </span>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function ResourceCostPanel({ overview }: { readonly overview: TechnicalMetricsOverview | null }) {
-  const resources = overview?.resources ?? [];
-
-  return (
-    <section className="rounded-3xl border border-zinc-800 bg-zinc-900 overflow-hidden">
-      <div className="border-b border-zinc-800 p-5">
-        <h3 className="text-lg font-bold text-white">Recursos y costo asociado</h3>
-        <p className="text-xs text-zinc-500">El costo solo se muestra cuando hay relacion exacta por recurso.</p>
-      </div>
-      <div className="max-h-[360px] overflow-auto custom-scrollbar">
-        {resources.length === 0 ? (
-          <EmptyState text="Sin recursos con metricas tecnicas" />
-        ) : resources.map((resource) => (
-          <div key={resource.externalResourceId} className="border-b border-zinc-800 p-4 last:border-b-0">
-            <div className="flex items-start justify-between gap-4">
-              <div className="min-w-0">
-                <p className="truncate text-sm font-black text-white">{resource.name ?? shortResource(resource.externalResourceId)}</p>
-                <p className="mt-1 truncate text-xs text-zinc-500">{resource.provider} · {resource.serviceName ?? 'Servicio no normalizado'}</p>
-              </div>
-              <div className="text-right">
-                <p className="text-sm font-black text-tak-yellow">
-                  {resource.cost === undefined ? '-' : formatCurrency(resource.cost.totalCost, resource.cost.currency)}
-                </p>
-                <p className="text-[10px] font-black uppercase text-zinc-500">
-                  {resource.cost?.matchLevel ?? 'NONE'}
-                </p>
-              </div>
-            </div>
-            <p className="mt-2 text-[10px] font-bold uppercase tracking-widest text-zinc-600">
-              {resource.metricNames.join(' · ')}
-            </p>
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function SamplesTable({ samples, loading }: {
-  readonly samples: readonly ResourceMetricSampleItem[];
-  readonly loading: boolean;
-}) {
-  return (
-    <section className="rounded-3xl border border-zinc-800 bg-zinc-900 overflow-hidden">
-      <div className="border-b border-zinc-800 p-5">
-        <h3 className="text-lg font-bold text-white">Muestras recientes</h3>
-        <p className="text-xs text-zinc-500">Detalle crudo para auditoria rapida.</p>
-      </div>
-      <div className="overflow-x-auto custom-scrollbar">
-        <table className="w-full min-w-[680px] text-left">
-          <thead>
-            <tr className="bg-zinc-950/50">
-              <Th>Momento</Th>
-              <Th>Recurso</Th>
-              <Th>Metrica</Th>
-              <Th>Valor</Th>
-              <Th>Granularidad</Th>
-            </tr>
-          </thead>
-          <tbody>
-            {loading ? (
-              <EmptyRow colSpan={5} text="Cargando muestras..." />
-            ) : samples.length === 0 ? (
-              <EmptyRow colSpan={5} text="Sin muestras tecnicas registradas" />
-            ) : samples.map((sample) => (
-              <tr key={sample.id} className="border-b border-zinc-800/50 transition-colors last:border-0 hover:bg-zinc-800/50">
-                <td className="p-4 text-xs font-medium text-zinc-400">{formatDateTime(sample.sampledAt)}</td>
-                <td className="p-4 text-xs text-zinc-300">{shortResource(sample.externalResourceId)}</td>
-                <td className="p-4 text-sm font-bold text-white">{sample.metricName}</td>
-                <td className="p-4 text-sm text-zinc-200">{formatMetricValue(sample.value, sample.metricUnit)}</td>
-                <td className="p-4 text-xs text-zinc-400">{formatGranularity(sample.granularitySeconds)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </section>
-  );
-}
-
-function Th({ children }: { readonly children: ReactNode }) {
-  return (
-    <th className="border-b border-zinc-800 p-4 text-xs font-bold uppercase tracking-widest text-zinc-500">
-      {children}
-    </th>
-  );
-}
-
-function EmptyRow({ colSpan, text }: { readonly colSpan: number; readonly text: string }) {
-  return (
-    <tr>
-      <td colSpan={colSpan} className="p-6 text-center text-sm font-bold text-zinc-500">{text}</td>
-    </tr>
-  );
-}
-
-function EmptyState({ text }: { readonly text: string }) {
-  return (
-    <div className="flex h-full min-h-[160px] w-full items-center justify-center p-6 text-center text-sm font-bold text-zinc-500">
-      {text}
-    </div>
-  );
-}
-
-function buildRangeParams(
-  range: RangeFilter,
-  coverage: TechnicalMetricCoverage | null,
-): {
-  readonly startDate?: string;
-  readonly endDate?: string;
-} {
-  if (range === 'available') {
-    return coverage?.minSampledAt !== undefined && coverage.maxSampledAt !== undefined
-      ? { startDate: coverage.minSampledAt, endDate: coverage.maxSampledAt }
-      : {};
-  }
-
-  const endDate = new Date();
-  const startDate = new Date(endDate);
-  const hours = range === '24h' ? 24 : range === '7d' ? 24 * 7 : 24 * 30;
-  startDate.setUTCHours(startDate.getUTCHours() - hours);
-
-  return {
-    startDate: startDate.toISOString(),
-    endDate: endDate.toISOString(),
-  };
-}
-
-function resolveRequestBucket(bucket: TechnicalMetricBucket, range: RangeFilter): TechnicalMetricBucket {
-  if (bucket !== 'auto' || range === 'available') {
-    return bucket;
-  }
-
-  return range === '24h' ? 'hour' : 'day';
-}
-function getSeriesCache(
-  cache: Map<string, SeriesCacheEntry>,
-  key: string,
-): SeriesCacheEntry | null {
-  const entry = cache.get(key);
-  if (entry === undefined) {
-    return null;
-  }
-
-  if (Date.now() - entry.createdAt > seriesCacheTtlMs) {
-    cache.delete(key);
-    return null;
-  }
-
-  cache.delete(key);
-  cache.set(key, entry);
-  return entry;
-}
-
-function setSeriesCache(
-  cache: Map<string, SeriesCacheEntry>,
-  key: string,
-  entry: SeriesCacheEntry,
-): void {
-  cache.set(key, entry);
-
-  while (cache.size > maxSeriesCacheEntries) {
-    const oldestKey = cache.keys().next().value;
-    if (oldestKey === undefined) {
-      return;
-    }
-    cache.delete(oldestKey);
-  }
-}
-
-function formatRange(overview: TechnicalMetricsOverview | null): string {
-  if (overview?.minSampledAt === undefined || overview.maxSampledAt === undefined) {
-    return 'Sin rango disponible';
-  }
-
-  return `${formatShortDate(overview.minSampledAt)} - ${formatShortDate(overview.maxSampledAt)}`;
-}
-
-function formatDateTime(value: string | undefined): string {
-  if (value === undefined) {
-    return 'Sin datos';
-  }
-
-  return new Intl.DateTimeFormat('es-CO', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
-}
-
-function formatShortDate(value: string): string {
-  return new Intl.DateTimeFormat('es-CO', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }).format(new Date(value));
-}
-
-function formatNumber(value: number): string {
-  return new Intl.NumberFormat('es-CO').format(value);
-}
-
-function formatCurrency(value: number, currency: string): string {
-  return currencyFormatter.format(value).replace('$', currency === 'USD' ? '$' : `${currency} `);
-}
-
-function formatMetricValue(value: number, unit: string | undefined): string {
-  const formatted = Math.abs(value) >= 1000000
-    ? new Intl.NumberFormat('es-CO', { notation: 'compact', maximumFractionDigits: 2 }).format(value)
-    : new Intl.NumberFormat('es-CO', { maximumFractionDigits: value >= 100 ? 0 : 2 }).format(value);
-
-  return unit === undefined ? formatted : `${formatted} ${unit}`;
-}
-
-function formatGranularity(seconds: number): string {
-  if (seconds % 3600 === 0) {
-    return `${seconds / 3600} h`;
-  }
-
-  if (seconds % 60 === 0) {
-    return `${seconds / 60} min`;
-  }
-
-  return `${seconds} s`;
-}
-
-function shortResource(value: string): string {
-  if (value.length <= 28) {
-    return value;
-  }
-
-  return `${value.slice(0, 14)}...${value.slice(-10)}`;
 }

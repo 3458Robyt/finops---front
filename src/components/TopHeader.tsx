@@ -1,5 +1,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useAccessToken } from '../auth/authSession';
+import { roleLabel, type CurrentView } from './navigation';
 import {
   dismissNotification,
   fetchNotifications,
@@ -9,14 +11,12 @@ import {
   type InAppNotification,
 } from '../services/api';
 
-type CurrentView = 'login' | 'dashboard' | 'console' | 'chat' | 'history' | 'profile' | 'resource_detail' | 'agent_settings' | 'ingesta' | 'metricas_tecnicas' | 'master_admin' | 'cloud_inventory' | 'cloud_resource_detail' | 'budgets' | 'cost_allocation' | 'value_realization';
 interface TopHeaderProps {
   currentView: CurrentView;
   activeTenant: AuthTenant;
   availableTenants: readonly AuthTenant[];
   onTenantChange: (tenantId: string) => Promise<void>;
   role: ApiRole;
-  token: string;
 }
 
 const viewTitles: Partial<Record<CurrentView, string>> = {
@@ -28,17 +28,12 @@ const viewTitles: Partial<Record<CurrentView, string>> = {
   history: 'Historial de Optimizaciones',
   profile: 'Perfil de Usuario y Seguridad',
   agent_settings: 'Gobierno del Agente IA',
+  messaging: 'Mensajería',
   ingesta: 'Ingesta y Calidad de Datos',
   metricas_tecnicas: 'Métricas Técnicas',
   master_admin: 'Administracion MSP',
   value_realization: 'Centro de valor realizado',
 };
-
-const currencyFormatter = new Intl.NumberFormat('en-US', {
-  style: 'currency',
-  currency: 'USD',
-  maximumFractionDigits: 2,
-});
 
 export default function TopHeader({
   currentView,
@@ -46,8 +41,8 @@ export default function TopHeader({
   availableTenants,
   onTenantChange,
   role,
-  token,
 }: TopHeaderProps) {
+  const token = useAccessToken();
   const [notifications, setNotifications] = useState<readonly InAppNotification[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
   const [open, setOpen] = useState(false);
@@ -136,16 +131,10 @@ export default function TopHeader({
     }
   };
 
-  const roleLabel = role === 'MASTER_ADMIN'
-    ? 'Maestro'
-    : role === 'ADMIN' || role === 'OPERATOR_ADMIN' || role === 'FINOPS_TECHNICIAN'
-      ? 'Admin'
-      : 'Cliente';
-
   if (currentView === 'login') return null;
 
   return (
-    <header className="sticky top-0 z-40 bg-zinc-950/80 backdrop-blur-md border-b border-zinc-800 px-4 lg:px-10 py-3 lg:py-4 flex items-center justify-between">
+    <header className="z-40 flex shrink-0 items-center justify-between border-b border-zinc-800 bg-zinc-950/80 px-3 py-3 backdrop-blur-md sm:px-4 lg:px-6 lg:py-4 xl:px-10">
       <div className="flex items-center gap-4 lg:gap-8 flex-1">
         <div className="lg:hidden size-8 bg-tak-yellow flex items-center justify-center rounded shadow-sm">
           <span className="material-symbols-outlined text-zinc-950 text-xl font-bold">query_stats</span>
@@ -158,7 +147,7 @@ export default function TopHeader({
       <div className="flex items-center gap-3 lg:gap-6 ml-4">
           <div className="hidden sm:flex flex-col items-end mr-2 relative group cursor-pointer">
             <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest mb-1">
-              Tenant activo · {roleLabel}
+               Tenant activo · {roleLabel(role)}
             </span>
             <select
               aria-label="Tenant activo"
@@ -222,7 +211,7 @@ export default function TopHeader({
                     </div>
                     {notification.missedSavingsAmount !== undefined && (
                       <p className="mt-3 text-[11px] font-black uppercase tracking-widest text-tak-yellow">
-                        Ahorro no capturado: {currencyFormatter.format(notification.missedSavingsAmount)}
+                        Ahorro no capturado: {formatCurrency(notification.missedSavingsAmount, notification.currency)}
                       </p>
                     )}
                     {notification.persisted && (
@@ -250,4 +239,15 @@ export default function TopHeader({
       </div>
     </header>
   );
+}
+
+function formatCurrency(value: number, currency: string): string {
+  const normalizedCurrency = /^[A-Z]{3}$/.test(currency.trim().toUpperCase())
+    ? currency.trim().toUpperCase()
+    : 'USD';
+  return new Intl.NumberFormat('es-CO', {
+    style: 'currency',
+    currency: normalizedCurrency,
+    maximumFractionDigits: 2,
+  }).format(value);
 }

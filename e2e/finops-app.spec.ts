@@ -1,6 +1,10 @@
+import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { expect, test } from '@playwright/test';
+
+const fixtureFile = resolve(process.env['E2E_FIXTURE_FILE'] ?? '../finops-backend/.test-artifacts/e2e-fixtures.json');
+test.skip(!existsSync(fixtureFile), 'Requiere la suite E2E completa con fixtures aislados. Usa npm run test:e2e:full.');
 
 interface FixtureManifest {
   readonly password: string;
@@ -36,9 +40,29 @@ test.describe('FinOps app E2E', () => {
     await expect(tenantSelector).toContainText(manifest.tenants[0]?.name ?? '');
     await expect(tenantSelector).toContainText(manifest.tenants[1]?.name ?? '');
     if (manifest.tenants[1] !== undefined) {
+      const switchToSecondTenant = page.waitForResponse((response) => (
+        response.url().includes('/api/v1/auth/switch-tenant')
+        && response.request().method() === 'POST'
+        && response.ok()
+      ));
       const selectedTenant = await tenantSelector.selectOption({ label: manifest.tenants[1].name });
       expect(selectedTenant).toHaveLength(1);
-      await tenantSelector.selectOption({ label: manifest.tenants[0]?.name ?? '' });
+      // Tenant switching rotates the session asynchronously and disables the
+      // selector while the request is in flight. Wait for the response and the
+      // controlled value before switching back, otherwise the next assertions
+      // can run against the previous tenant's token and remount the analysis
+      // panel.
+      await switchToSecondTenant;
+      await expect(tenantSelector).toHaveValue(selectedTenant[0]!);
+      const switchBackToFirstTenant = page.waitForResponse((response) => (
+        response.url().includes('/api/v1/auth/switch-tenant')
+        && response.request().method() === 'POST'
+        && response.ok()
+      ));
+      const restoredTenant = await tenantSelector.selectOption({ label: manifest.tenants[0]?.name ?? '' });
+      expect(restoredTenant).toHaveLength(1);
+      await switchBackToFirstTenant;
+      await expect(tenantSelector).toHaveValue(restoredTenant[0]!);
     }
 
     const recommendationId = manifest.recommendationIds[0]!;
@@ -155,6 +179,7 @@ test.describe('FinOps app E2E', () => {
     await cloudConnectionSelector.selectOption({ index: 1 });
     await expect(page.getByText(/acceso seguro de solo lectura/i)).toBeVisible();
     await expect(page.getByText(/validar capacidades/i)).toBeVisible();
+    await page.getByText(/configuración técnica avanzada/i).click();
     await expect(page.getByText(/sincronización inicial/i)).toBeVisible();
     await expect(page.getByRole('button', { name: /abrir inventario/i })).toBeVisible();
 
@@ -198,6 +223,5 @@ test.describe('FinOps app E2E', () => {
 });
 
 async function readManifest(): Promise<FixtureManifest> {
-  const fixtureFile = resolve(process.env['E2E_FIXTURE_FILE'] ?? '../finops-backend/.test-artifacts/e2e-fixtures.json');
   return JSON.parse(await readFile(fixtureFile, 'utf8')) as FixtureManifest;
 }

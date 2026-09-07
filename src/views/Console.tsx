@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
+import { useAccessToken } from '../auth/authSession';
+import RecommendationGenerationAction from '../components/RecommendationGenerationAction';
 import {
   fetchAnalyticsEfficiencyInsights,
   fetchAnalyticsOpportunities,
@@ -7,18 +9,14 @@ import {
   type CostOpportunity,
   type Recommendation,
   type UsageInsight,
+  type ApiRole,
 } from '../services/api';
 
 interface ConsoleProps {
-  readonly token: string;
   readonly onResourceSelect?: (id: string) => void;
+  readonly apiRole?: ApiRole;
+  readonly onOpenAgentSettings?: () => void;
 }
-
-const currencyFormatter = new Intl.NumberFormat('en-US', {
-  style: 'currency',
-  currency: 'USD',
-  maximumFractionDigits: 2,
-});
 
 const severityWeight: Record<Recommendation['severity'], number> = {
   CRITICAL: 4,
@@ -27,12 +25,20 @@ const severityWeight: Record<Recommendation['severity'], number> = {
   LOW: 1,
 };
 
-export default function Console({ token, onResourceSelect }: ConsoleProps) {
+export default function Console({ onResourceSelect, apiRole, onOpenAgentSettings }: ConsoleProps) {
+  const token = useAccessToken();
   const [recommendations, setRecommendations] = useState<readonly Recommendation[]>([]);
   const [opportunities, setOpportunities] = useState<readonly CostOpportunity[]>([]);
   const [usageInsights, setUsageInsights] = useState<readonly UsageInsight[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [refreshVersion, setRefreshVersion] = useState(0);
+
+  useEffect(() => {
+    const refresh = () => setRefreshVersion((version) => version + 1);
+    window.addEventListener('finops:recommendations-updated', refresh);
+    return () => window.removeEventListener('finops:recommendations-updated', refresh);
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -57,7 +63,7 @@ export default function Console({ token, onResourceSelect }: ConsoleProps) {
       })
       .then((analyticsResponse) => {
         if (active && analyticsResponse !== null) {
-          setOpportunities(analyticsResponse.anomalies);
+          setOpportunities(analyticsResponse.opportunities ?? analyticsResponse.anomalies ?? []);
           setUsageInsights(analyticsResponse.usageInsights);
         }
       })
@@ -75,7 +81,7 @@ export default function Console({ token, onResourceSelect }: ConsoleProps) {
     return () => {
       active = false;
     };
-  }, [token]);
+  }, [refreshVersion, token]);
 
   const tableData = useMemo(
     () => [...recommendations]
@@ -83,7 +89,7 @@ export default function Console({ token, onResourceSelect }: ConsoleProps) {
     [recommendations],
   );
   const criticalOpportunityCount = opportunities.filter((row) => row.severity === 'HIGH' || row.severity === 'CRITICAL').length;
-  const totalSavings = tableData.reduce((total, row) => total + (row.estimatedMonthlySavings ?? 0), 0);
+  const totalSavingsLabel = formatCurrencySummary(tableData);
   const computeCount = tableData.filter((row) => row.type.includes('COMPUTE')).length;
 
   return (
@@ -92,6 +98,14 @@ export default function Console({ token, onResourceSelect }: ConsoleProps) {
         <div className="rounded-2xl border border-red-500/20 bg-red-500/10 px-5 py-4 text-sm font-bold text-red-300">
           {error}
         </div>
+      )}
+
+      {apiRole !== undefined && (
+        <RecommendationGenerationAction
+          role={apiRole}
+          onCompleted={() => window.dispatchEvent(new CustomEvent('finops:recommendations-updated'))}
+          onOpenAnalysis={onOpenAgentSettings}
+        />
       )}
 
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 lg:gap-6">
@@ -113,7 +127,7 @@ export default function Console({ token, onResourceSelect }: ConsoleProps) {
           <p className="text-zinc-400 text-xs font-bold uppercase tracking-widest mb-2">Ahorro Estimado</p>
           <div className="flex items-center gap-3">
             <span className="material-symbols-outlined text-red-500 text-3xl">trending_up</span>
-            <h3 className="text-3xl font-black text-white">{loading ? '...' : currencyFormatter.format(totalSavings)}</h3>
+            <h3 className="text-3xl font-black text-white">{loading ? '...' : totalSavingsLabel}</h3>
           </div>
         </div>
       </div>
@@ -124,7 +138,7 @@ export default function Console({ token, onResourceSelect }: ConsoleProps) {
             <span className="material-symbols-outlined text-tak-yellow">speed</span>
             Consumo y Eficiencia FOCUS
           </h3>
-          <p className="text-xs text-zinc-500 mt-1">Estas señales usan consumo facturado; CPU, memoria e IOPS requieren métricas técnicas separadas.</p>
+          <p className="text-xs text-zinc-500 mt-1">Costo unitario = costo facturado ÷ consumo. Se muestra en la moneda nativa reportada por FOCUS (por ejemplo, COP); CPU, memoria e IOPS requieren métricas técnicas separadas.</p>
         </div>
         <div className="overflow-x-auto custom-scrollbar">
           <table className="w-full text-left border-collapse min-w-[720px]">
@@ -133,7 +147,7 @@ export default function Console({ token, onResourceSelect }: ConsoleProps) {
                 <th className="p-4 text-xs font-bold text-zinc-500 uppercase tracking-widest border-b border-zinc-800">Señal</th>
                 <th className="p-4 text-xs font-bold text-zinc-500 uppercase tracking-widest border-b border-zinc-800">Severidad</th>
                 <th className="p-4 text-xs font-bold text-zinc-500 uppercase tracking-widest border-b border-zinc-800">Consumo</th>
-                <th className="p-4 text-xs font-bold text-zinc-500 uppercase tracking-widest border-b border-zinc-800">Costo unitario</th>
+                <th className="p-4 text-xs font-bold text-zinc-500 uppercase tracking-widest border-b border-zinc-800">Costo unitario (moneda nativa)</th>
                 <th className="p-4 text-xs font-bold text-zinc-500 uppercase tracking-widest border-b border-zinc-800">Lectura</th>
               </tr>
             </thead>
@@ -152,7 +166,7 @@ export default function Console({ token, onResourceSelect }: ConsoleProps) {
                     {insight.consumedQuantity === undefined ? '-' : `${formatNumber(insight.consumedQuantity)} ${insight.consumedUnit ?? ''}`}
                   </td>
                   <td className="p-4 text-sm text-white font-black">
-                    {insight.unitCost === undefined ? '-' : currencyFormatter.format(insight.unitCost)}
+                    {insight.unitCost === undefined ? '-' : formatUnitCost(insight.unitCost, insight.currency)}
                   </td>
                   <td className="p-4 text-sm text-zinc-400 font-medium">{insight.description}</td>
                 </tr>
@@ -191,7 +205,7 @@ export default function Console({ token, onResourceSelect }: ConsoleProps) {
                     <span className="bg-red-500/10 text-red-300 text-[10px] font-bold px-2 py-1 rounded uppercase">{opportunity.severity}</span>
                   </td>
                   <td className="p-4 text-sm text-white font-black">
-                    {currencyFormatter.format(opportunity.deltaAmount)} / {opportunity.deltaPercent.toFixed(1)}%
+                    {formatOpportunityAmount(opportunity)} / {opportunity.deltaPercent.toFixed(1)}%
                   </td>
                   <td className="p-4 text-sm text-zinc-400 font-medium">{opportunity.explanation}</td>
                 </tr>
@@ -241,7 +255,7 @@ export default function Console({ token, onResourceSelect }: ConsoleProps) {
                     <td className="p-4 text-sm text-zinc-400 font-medium">{evidence.metric ?? row.severity}</td>
                     <td className="p-4 text-sm text-tak-yellow font-bold uppercase tracking-tight">{evidence.action ?? row.title}</td>
                     <td className="p-4 text-sm text-white font-black text-right">
-                      {currencyFormatter.format(row.estimatedMonthlySavings ?? 0)}
+                      {formatCurrency(row.estimatedMonthlySavings ?? 0, row.currency)}
                     </td>
                     <td className="p-4 flex justify-center">
                       <button
@@ -293,4 +307,61 @@ function formatNumber(value: number): string {
   return new Intl.NumberFormat('es-CO', {
     maximumFractionDigits: value >= 100 ? 0 : 2,
   }).format(value);
+}
+
+function formatCurrency(value: number, currency: string): string {
+  const normalizedCurrency = normalizeCurrency(currency);
+  return new Intl.NumberFormat('es-CO', {
+    style: 'currency',
+    currency: normalizedCurrency,
+    currencyDisplay: 'code',
+    maximumFractionDigits: 2,
+  }).format(value);
+}
+
+/**
+ * Muestra precios unitarios con suficiente precisión y el código ISO explícito.
+ * Estos valores son costo facturado FOCUS / consumo FOCUS en la moneda nativa;
+ * no se convierten silenciosamente ni se confunden con USD por el símbolo `$`.
+ */
+function formatUnitCost(value: number, currency: string): string {
+  return new Intl.NumberFormat('es-CO', {
+    style: 'currency',
+    currency: normalizeCurrency(currency),
+    currencyDisplay: 'code',
+    maximumFractionDigits: 8,
+  }).format(value);
+}
+
+function normalizeCurrency(currency: string): string {
+  const normalizedCurrency = currency.trim().toUpperCase();
+  return /^[A-Z]{3}$/.test(normalizedCurrency) ? normalizedCurrency : 'USD';
+}
+
+function formatCurrencySummary(recommendations: readonly Recommendation[]): string {
+  const totals = new Map<string, number>();
+  for (const recommendation of recommendations) {
+    const currency = recommendation.currency.trim().toUpperCase() || 'USD';
+    totals.set(currency, (totals.get(currency) ?? 0) + (recommendation.estimatedMonthlySavings ?? 0));
+  }
+  if (totals.size === 0) return formatCurrency(0, 'USD');
+  return [...totals.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([currency, amount]) => formatCurrency(amount, currency))
+    .join(' · ');
+}
+
+function formatOpportunityAmount(opportunity: CostOpportunity): string {
+  const currency = readCurrency(opportunity.evidence);
+  return currency === undefined
+    ? `${formatNumber(opportunity.deltaAmount)} (moneda no disponible)`
+    : formatCurrency(opportunity.deltaAmount, currency);
+}
+
+function readCurrency(value: unknown): string | undefined {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const currency = (value as Record<string, unknown>)['currency'];
+  return typeof currency === 'string' && /^[A-Z]{3}$/i.test(currency.trim())
+    ? currency.trim().toUpperCase()
+    : undefined;
 }

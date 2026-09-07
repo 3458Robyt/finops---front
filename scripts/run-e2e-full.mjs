@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
-import { access } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { access, unlink } from 'node:fs/promises';
+import { isAbsolute, relative, resolve } from 'node:path';
 
 const isWindows = process.platform === 'win32';
 const command = (name) => name;
@@ -93,10 +93,28 @@ async function stop(child) {
   }
 }
 
+async function removeFixtureManifest(filePath) {
+  const artifactsRoot = resolve(backendDir, '.test-artifacts');
+  const resolvedFilePath = resolve(filePath);
+  const relativeFilePath = relative(artifactsRoot, resolvedFilePath);
+  if (relativeFilePath.startsWith('..') || isAbsolute(relativeFilePath)) {
+    throw new Error('Refusing to delete an E2E manifest outside finops-backend/.test-artifacts.');
+  }
+
+  await unlink(resolvedFilePath).catch((error) => {
+    if (error?.code !== 'ENOENT') throw error;
+  });
+}
+
 const fixtureEnv = {
   ...process.env,
+  TEST_DATABASE_URL: testDatabaseUrl,
   E2E_FIXTURE_FILE: fixtureFile,
   ALLOW_DESTRUCTIVE_TEST_DATABASE: 'true',
+};
+const migrationEnv = {
+  ...fixtureEnv,
+  DATABASE_URL: testDatabaseUrl,
 };
 const backendEnv = {
   ...process.env,
@@ -126,14 +144,21 @@ try {
     throw new Error(`${backendUrl} is already in use; stop the existing backend before running the full E2E suite.`);
   }
   await access(backendDir);
+  await run(command('npx'), ['prisma', 'migrate', 'deploy'], { cwd: backendDir, env: migrationEnv });
   await run(command('npm'), ['run', 'test:fixtures:create'], { cwd: backendDir, env: fixtureEnv });
   backend = start(command('npx'), ['tsx', 'src/index.ts'], backendEnv, backendDir);
   await waitFor(`${backendUrl}/health`);
   frontend = start(command('npx'), ['vite', '--host', '127.0.0.1', '--port', '5173'], frontendEnv, resolve('.'));
   await waitFor(`${frontendUrl}/`);
-  await run(command('npx'), ['playwright', 'test'], { cwd: resolve('.') , env: frontendEnv });
+  // The database-backed specs intentionally share one isolated fixture tenant.
+  // Run them serially so concurrent analysis commands cannot race on the same durable job.
+  await run(command('npx'), ['playwright', 'test', '--workers=1'], { cwd: resolve('.') , env: frontendEnv });
 } finally {
   await stop(frontend);
   await stop(backend);
-  await run(command('npm'), ['run', 'test:fixtures:cleanup'], { cwd: backendDir, env: fixtureEnv });
+  try {
+    await run(command('npm'), ['run', 'test:fixtures:cleanup'], { cwd: backendDir, env: fixtureEnv });
+  } finally {
+    await removeFixtureManifest(fixtureFile);
+  }
 }
